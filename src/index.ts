@@ -1,18 +1,21 @@
 /**
  * Queen Claudia's Solana Trading Bot
- * Conservative momentum strategy with strict risk management
  * 
- * Strategy: Hybrid DCA + Momentum
- * - Scans for established tokens with strong momentum signals
- * - Applies 5-point entry filter (liquidity, age, volume, resistance, sentiment)
- * - Enforces hard stop loss (-15%) and take profit (+30%) on every trade
- * - Portfolio hard stop at -30% total loss
+ * Requirements:
+ * 1. Runs as continuous daemon (PM2)
+ * 2. Scans markets every 20-30s
+ * 3. Checks positions every 10s
+ * 4. Auto-restarts via PM2/Docker on crash
+ * 5. Heartbeat logs every 5 mins
+ * 6. State file survives restarts
+ * 7. Telegram alerts for all important events
+ * 8. Daily performance report at 6am UTC via Telegram
  */
 
 import { validateConfig, config } from './config';
 import { initTrader, getSolPriceUsd, getSolBalance, buyToken } from './trader';
 import { scanForCandidates } from './scanner';
-import { evaluateToken } from './strategy';
+import { evaluateToken, shouldSell } from './strategy';
 import {
   loadPortfolio,
   savePortfolio,
@@ -22,10 +25,36 @@ import {
   closePosition,
   printSummary,
 } from './portfolio';
-import { shouldSell } from './strategy';
+import {
+  alertBotStarted,
+  alertBotRestarted,
+  alertPositionOpened,
+  alertPositionClosed,
+  alertPortfolioStop,
+  alertHeartbeat,
+  alertCriticalError,
+  sendDailyReport,
+} from './telegram';
 import axios from 'axios';
+import fs from 'fs';
+import path from 'path';
 
-const GBP_TO_USD = 1.27; // approximate — update periodically
+const GBP_TO_USD = 1.27;
+const STATE_FLAG = path.join(__dirname, '../data/.last_start');
+
+let solPriceUsd = 0;
+let lastDailyReportDate = '';
+let isFirstStart = true;
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+async function refreshSolPrice(): Promise<void> {
+  try {
+    solPriceUsd = await getSolPriceUsd();
+  } catch {
+    console.warn('⚠️  Could not refresh SOL price');
+  }
+}
 
 async function getCurrentTokenPrice(tokenAddress: string): Promise<number | null> {
   try {
@@ -40,8 +69,45 @@ async function getCurrentTokenPrice(tokenAddress: string): Promise<number | null
   }
 }
 
-async function monitorPositions(portfolio: ReturnType<typeof loadPortfolio>, solPriceUsd: number): Promise<void> {
-  for (const position of portfolio.openPositions) {
+function writeHeartbeatLog(portfolio: ReturnType<typeof loadPortfolio>): void {
+  const logDir = path.join(__dirname, '../logs');
+  if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+
+  const entry = {
+    timestamp: new Date().toISOString(),
+    status: portfolio.isHalted ? 'HALTED' : 'RUNNING',
+    solPriceUsd,
+    capitalGbp: portfolio.currentCapitalGbp,
+    totalPnlGbp: portfolio.totalPnlGbp,
+    totalPnlPercent: portfolio.totalPnlPercent,
+    openPositions: portfolio.openPositions.length,
+    closedPositions: portfolio.closedPositions.length,
+  };
+
+  const logFile = path.join(logDir, 'heartbeat.log');
+  fs.appendFileSync(logFile, JSON.stringify(entry) + '\n');
+  console.log(`💓 Heartbeat logged @ ${entry.timestamp}`);
+}
+
+function detectRestart(): boolean {
+  const dataDir = path.join(__dirname, '../data');
+  if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+
+  if (fs.existsSync(STATE_FLAG)) {
+    return true; // was previously running → this is a restart
+  }
+  fs.writeFileSync(STATE_FLAG, new Date().toISOString());
+  return false;
+}
+
+// ─── Position monitor (every 10s) ───────────────────────────────────────────
+
+async function monitorPositions(): Promise<void> {
+  const portfolio = loadPortfolio();
+  if (portfolio.openPositions.length === 0) return;
+
+  let changed = false;
+  for (const position of [...portfolio.openPositions]) {
     const currentPrice = await getCurrentTokenPrice(position.tokenAddress);
     if (!currentPrice) continue;
 
@@ -54,131 +120,203 @@ async function monitorPositions(portfolio: ReturnType<typeof loadPortfolio>, sol
     );
 
     if (sell) {
-      console.log(`🔔 ${reason} for ${position.tokenSymbol}`);
-      closePosition(portfolio, position.id, currentPrice, 
-        currentPrice <= position.stopLossPrice ? 'stop_loss' : 'take_profit',
-        solPriceUsd
-      );
+      const closeReason = currentPrice <= position.stopLossPrice ? 'stop_loss' : 'take_profit';
+      console.log(`🔔 ${reason} — closing ${position.tokenSymbol}`);
+      closePosition(portfolio, position.id, currentPrice, closeReason, solPriceUsd);
+      const closed = portfolio.closedPositions[portfolio.closedPositions.length - 1];
+      await alertPositionClosed(closed);
+      changed = true;
     }
   }
+
+  if (changed) savePortfolio(portfolio);
 }
 
-async function runCycle(): Promise<void> {
+// ─── Market scan (every 25s) ─────────────────────────────────────────────────
+
+async function scanMarkets(): Promise<void> {
   const portfolio = loadPortfolio();
 
-  // Check if bot is halted
-  if (portfolio.isHalted) {
-    console.log(`🛑 Bot halted: ${portfolio.haltReason}`);
-    printSummary(portfolio);
-    return;
-  }
+  if (portfolio.isHalted) return;
 
-  // Check portfolio stop
+  // Check portfolio stop loss
   if (checkPortfolioStop(portfolio)) {
     savePortfolio(portfolio);
+    await alertPortfolioStop(portfolio);
     return;
   }
 
-  let solPriceUsd: number;
-  try {
-    solPriceUsd = await getSolPriceUsd();
-    console.log(`💲 SOL price: $${solPriceUsd.toFixed(2)}`);
-  } catch {
-    console.error('❌ Could not get SOL price, skipping cycle');
-    return;
-  }
+  if (!canOpenPosition(portfolio)) return;
 
-  // Monitor existing positions
-  await monitorPositions(portfolio, solPriceUsd);
+  const candidates = await scanForCandidates();
 
-  // Scan for new opportunities if we can open positions
-  if (canOpenPosition(portfolio)) {
-    const candidates = await scanForCandidates();
+  for (const candidate of candidates) {
+    if (!canOpenPosition(portfolio)) break;
 
-    for (const candidate of candidates) {
-      if (!canOpenPosition(portfolio)) break;
+    const alreadyHolding = portfolio.openPositions.some(
+      p => p.tokenAddress === candidate.address
+    );
+    if (alreadyHolding) continue;
 
-      // Skip if already holding this token
-      const alreadyHolding = portfolio.openPositions.some(
-        p => p.tokenAddress === candidate.address
-      );
-      if (alreadyHolding) continue;
+    const signal = await evaluateToken(candidate);
+    if (!signal || signal.confidence < 0.7) continue;
 
-      const signal = await evaluateToken(candidate);
-      if (!signal || signal.confidence < 0.7) continue;
+    console.log(`\n🎯 Signal: ${candidate.symbol} (confidence: ${(signal.confidence * 100).toFixed(0)}%)`);
+    signal.reasons.forEach(r => console.log(`   ${r}`));
 
-      console.log(`\n🎯 Signal: ${candidate.symbol} (confidence: ${(signal.confidence * 100).toFixed(0)}%)`);
-      signal.reasons.forEach(r => console.log(`   ${r}`));
+    const txid = await buyToken(
+      candidate.address,
+      candidate.symbol,
+      config.maxPositionSizeGbp,
+      solPriceUsd,
+      GBP_TO_USD
+    );
 
-      // Execute buy
-      const txid = await buyToken(
+    if (txid) {
+      const position = openPosition(
+        portfolio,
         candidate.address,
         candidate.symbol,
+        candidate.priceUsd,
         config.maxPositionSizeGbp,
-        solPriceUsd,
-        GBP_TO_USD
+        solPriceUsd
       );
-
-      if (txid) {
-        openPosition(
-          portfolio,
-          candidate.address,
-          candidate.symbol,
-          candidate.priceUsd,
-          config.maxPositionSizeGbp,
-          solPriceUsd
-        );
-      }
-
-      // Small delay between trades
-      await new Promise(r => setTimeout(r, 2000));
+      savePortfolio(portfolio);
+      await alertPositionOpened(position);
     }
-  }
 
-  printSummary(portfolio);
-  savePortfolio(portfolio);
+    await new Promise(r => setTimeout(r, 2000));
+  }
 }
+
+// ─── Heartbeat (every 5 mins) ────────────────────────────────────────────────
+
+async function heartbeat(): Promise<void> {
+  await refreshSolPrice();
+  const portfolio = loadPortfolio();
+  writeHeartbeatLog(portfolio);
+  printSummary(portfolio);
+  await alertHeartbeat(portfolio, solPriceUsd);
+}
+
+// ─── Daily report (6am UTC) ──────────────────────────────────────────────────
+
+async function checkDailyReport(): Promise<void> {
+  const now = new Date();
+  const todayKey = now.toISOString().slice(0, 10);
+
+  if (now.getUTCHours() === config.dailyReportHour && lastDailyReportDate !== todayKey) {
+    lastDailyReportDate = todayKey;
+    const portfolio = loadPortfolio();
+    await sendDailyReport(portfolio, solPriceUsd);
+    console.log('📊 Daily report sent');
+  }
+}
+
+// ─── Main ────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  console.log('👑 Queen Claudia\'s Solana Trading Bot starting...');
-  console.log('================================================');
+  console.log('👑 Queen Claudia\'s Solana Trading Bot');
+  console.log('======================================');
 
-  // Validate config
-  validateConfig();
+  try {
+    validateConfig();
+    initTrader();
 
-  // Init trader (wallet + RPC connection)
-  initTrader();
+    const isRestart = detectRestart();
 
-  // Check wallet balance
-  const balance = await getSolBalance();
-  console.log(`💰 Wallet SOL balance: ${balance.toFixed(4)} SOL`);
+    const balance = await getSolBalance();
+    console.log(`💰 Wallet SOL balance: ${balance.toFixed(4)} SOL`);
 
-  if (balance < 0.05) {
-    console.warn('⚠️  Low SOL balance — please top up wallet before trading');
-  }
-
-  console.log(`\n⚙️  Bot settings:`);
-  console.log(`   Max position: £${config.maxPositionSizeGbp}`);
-  console.log(`   Max positions: ${config.maxPositions}`);
-  console.log(`   Stop loss: -${config.stopLossPercent}%`);
-  console.log(`   Take profit: +${config.takeProfitPercent}%`);
-  console.log(`   Portfolio stop: -${config.portfolioStopPercent}%`);
-  console.log(`   Scan interval: ${config.scanIntervalMs / 1000}s\n`);
-
-  // Run first cycle immediately
-  await runCycle();
-
-  // Then run on interval
-  setInterval(async () => {
-    try {
-      await runCycle();
-    } catch (err) {
-      console.error('❌ Cycle error:', err);
+    if (balance < 0.05) {
+      console.warn('⚠️  Low SOL balance — please top up wallet before trading');
     }
-  }, config.scanIntervalMs);
+
+    await refreshSolPrice();
+    console.log(`💲 SOL price: $${solPriceUsd.toFixed(2)}`);
+
+    const portfolio = loadPortfolio();
+    console.log(`\n📂 State loaded: ${portfolio.openPositions.length} open positions`);
+
+    console.log(`\n⚙️  Settings:`);
+    console.log(`   Market scan: every ${config.marketScanIntervalMs / 1000}s`);
+    console.log(`   Position check: every ${config.positionCheckIntervalMs / 1000}s`);
+    console.log(`   Heartbeat: every ${config.heartbeatIntervalMs / 1000 / 60} mins`);
+    console.log(`   Daily report: 06:00 UTC\n`);
+
+    // Alert Telegram
+    if (isRestart) {
+      await alertBotRestarted('PM2/Docker auto-restart after crash or server reboot');
+    } else {
+      await alertBotStarted();
+    }
+
+    // ── Start intervals ──
+
+    // Position monitor: every 10s
+    setInterval(async () => {
+      try {
+        await monitorPositions();
+      } catch (err: any) {
+        console.error('❌ Position monitor error:', err?.message);
+      }
+    }, config.positionCheckIntervalMs);
+
+    // Market scan: every 25s
+    setInterval(async () => {
+      try {
+        await scanMarkets();
+      } catch (err: any) {
+        console.error('❌ Market scan error:', err?.message);
+      }
+    }, config.marketScanIntervalMs);
+
+    // Heartbeat: every 5 mins
+    setInterval(async () => {
+      try {
+        await heartbeat();
+      } catch (err: any) {
+        console.error('❌ Heartbeat error:', err?.message);
+      }
+    }, config.heartbeatIntervalMs);
+
+    // Daily report check: every minute
+    setInterval(async () => {
+      try {
+        await checkDailyReport();
+      } catch (err: any) {
+        console.error('❌ Daily report error:', err?.message);
+      }
+    }, 60 * 1000);
+
+    // Run first cycles immediately
+    await monitorPositions();
+    await scanMarkets();
+
+    console.log('✅ Bot running. Press Ctrl+C to stop (or use PM2).\n');
+
+  } catch (err: any) {
+    console.error('💥 Fatal startup error:', err?.message);
+    await alertCriticalError(`Fatal startup error: ${err?.message}`);
+    // Don't exit — let PM2 handle restart
+    throw err;
+  }
 }
 
-main().catch(err => {
-  console.error('💥 Fatal error:', err);
+// Handle uncaught errors gracefully
+process.on('uncaughtException', async (err) => {
+  console.error('💥 Uncaught exception:', err);
+  await alertCriticalError(`Uncaught exception: ${err.message}`);
+  // PM2 will restart us
+  process.exit(1);
+});
+
+process.on('unhandledRejection', async (reason) => {
+  console.error('💥 Unhandled rejection:', reason);
+  await alertCriticalError(`Unhandled rejection: ${reason}`);
+});
+
+main().catch(async (err) => {
+  await alertCriticalError(`Startup failed: ${err?.message}`);
   process.exit(1);
 });

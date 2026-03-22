@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  trading-bot:
+    build: .
+    container_name: queen-claudia-bot
+    restart: unless-stopped   # auto-restart on crash or reboot
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data       # persist state across restarts
+      - ./logs:/app/logs       # persist logs across restarts
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
