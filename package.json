@@ -6,7 +6,12 @@
   "scripts": {
     "build": "tsc",
     "start": "ts-node src/index.ts",
-    "dev": "ts-node --watch src/index.ts"
+    "dev": "ts-node --watch src/index.ts",
+    "pm2:start": "pm2 start ecosystem.config.js",
+    "pm2:stop": "pm2 stop queen-claudia-bot",
+    "pm2:restart": "pm2 restart queen-claudia-bot",
+    "pm2:logs": "pm2 logs queen-claudia-bot",
+    "pm2:status": "pm2 status"
   },
   "keywords": [],
   "author": "",
